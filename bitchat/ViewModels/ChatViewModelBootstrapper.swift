@@ -177,6 +177,7 @@ private extension ChatViewModelBootstrapper {
 
     func loadPersistedViewState() {
         viewModel.loadNickname()
+        if HubConfig().enabled { viewModel.nickname = HubProtocol.nickname }
         viewModel.loadVerifiedFingerprints()
     }
 

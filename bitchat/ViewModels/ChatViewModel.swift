@@ -202,6 +202,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, SynchronousMessage
     private lazy var outgoingCoordinator = ChatOutgoingCoordinator(context: self)
     private lazy var lifecycleCoordinator = ChatLifecycleCoordinator(context: self)
     private lazy var transportEventCoordinator = ChatTransportEventCoordinator(context: self)
+    @MainActor lazy var hubBridge = HubBitchatBridge(viewModel: self)
     private lazy var peerListCoordinator = ChatPeerListCoordinator(context: self)
     private lazy var messageFormatter = ChatMessageFormatter(viewModel: self)
     lazy var peerIdentityCoordinator = ChatPeerIdentityCoordinator(context: self)

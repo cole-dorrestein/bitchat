@@ -179,6 +179,7 @@ extension ChatViewModel {
         // A finalized voice note whose burst already streamed in live swaps
         // into the existing bubble instead of appearing (and notifying) twice.
         if liveVoiceCoordinator.absorbFinalizedVoiceNote(message) { return }
+        hubBridge.receive(message)
         privateConversationCoordinator.handlePrivateMessage(message)
     }
 
