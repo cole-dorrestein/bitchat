@@ -305,6 +305,26 @@ struct HubBotServiceTests {
     }
 
     @Test @MainActor
+    func answerPartsAreSentOneMessageEachInOrder() async throws {
+        RecordingURLProtocol.reset()
+        let service = makeHub()
+        let peerID = PeerID(str: "0102030405060708")
+        var sent: [(text: String, peer: PeerID)] = []
+        service.handleIncomingPrivateMessage(from: peerID, content: "q") { text, peer in sent.append((text, peer)) }
+        let forwarded = await waitForRequests(count: 1)
+        #expect(forwarded)
+        let requestID = try #require(try postedJSON()["request_id"] as? String)
+
+        let parts = ["(1/2) 1. Boil it for 1 minute.", "(2/2) " + HubBotMessageFormat.disclaimer]
+        let callback = try JSONSerialization.data(withJSONObject: [
+            "request_id": requestID, "sender": peerID.id, "answer": "ignored when messages is present", "messages": parts
+        ])
+        service.handleCallback(body: callback)
+        #expect(Array(sent.suffix(2).map(\.text)) == parts)
+        #expect(sent.suffix(2).allSatisfy { $0.peer == peerID })
+    }
+
+    @Test @MainActor
     func inboundQuestionIsCappedBeforeForwarding() async throws {
         RecordingURLProtocol.reset()
         let service = makeHub(environment: ["HUB_MAX_QUESTION_CHARS": "256"])

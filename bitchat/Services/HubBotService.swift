@@ -334,9 +334,14 @@ final class HubBotService {
             let sender: String?
             let answer: String?
             let result: String?
+            /// The answer as "(i/n) " parts of at most 255 UTF-8 bytes with the
+            /// AI label last (protocol/README.md). BitChat rejects private
+            /// message content over 255 bytes (Protocols/Packets.swift:251-265),
+            /// so each part goes out as its own private message, in order.
+            let messages: [String]?
         }
         guard let payload = try? JSONDecoder().decode(CallbackPayload.self, from: body),
-              let answer = payload.answer ?? payload.result
+              payload.messages?.isEmpty == false || (payload.answer ?? payload.result) != nil
         else {
             SecureLogger.warning("HubBot: ignoring undecodable callback payload", category: .session)
             return
@@ -372,8 +377,16 @@ final class HubBotService {
         pending.removeValue(forKey: match.requestID)
         match.timeoutTask?.cancel()
 
-        // (c) Second private message with the answer, disclaimer appended if
-        // missing, always kept within the mesh short-text cap.
+        // (c) The answer parts, one private message each, in order.
+        if let messages = payload.messages, !messages.isEmpty {
+            SecureLogger.info("HubBot: answer for \(match.requestID.prefix(8))… (\(messages.count) parts)", category: .session)
+            messages.forEach { match.deliver($0) }
+            return
+        }
+
+        // A responder without `messages`: one message, disclaimer appended if
+        // missing, kept within the short-text cap.
+        let answer = payload.answer ?? payload.result ?? ""
         let text = HubBotMessageFormat.appendDisclaimerIfMissing(answer, maxLength: config.maxAnswerChars)
         SecureLogger.info("HubBot: answer for \(match.requestID.prefix(8))… (\(text.count) chars)", category: .session)
         match.deliver(text)
