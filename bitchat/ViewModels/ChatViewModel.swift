@@ -195,6 +195,9 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, SynchronousMessage
 
     let commandProcessor: CommandProcessor
     let messageRouter: MessageRouter
+    /// Offline hub bot (disaster-mesh "Ask"). Inert unless this peer is
+    /// configured as the hub — see `HubBotService` for the enable flag.
+    let hubBotService = HubBotService()
     let privateChatManager: PrivateChatManager
     let unifiedPeerService: UnifiedPeerService
     let autocompleteService: AutocompleteService
@@ -1241,6 +1244,10 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, SynchronousMessage
         if networkActivationAllowed {
             ChatViewModelBootstrapper(viewModel: self).configure()
         }
+
+        // Hub peer: starts the local callback listener only when the hub
+        // flag (Info.plist `BitchatHubPeerEnabled` / BITCHAT_HUB_PEER=1) is set.
+        hubBotService.start()
     }
 
     // MARK: - Deinitialization

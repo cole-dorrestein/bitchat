@@ -184,6 +184,11 @@ private final class MockChatPrivateConversationContext: ChatPrivateConversationC
         routedPrivateMessages.append((content, peerID, messageID))
     }
 
+    private(set) var hubBotMessages: [(peerID: PeerID, content: String)] = []
+    func hubBotHandleIncomingPrivateMessage(from peerID: PeerID, content: String) {
+        hubBotMessages.append((peerID, content))
+    }
+
     var routeReadReceiptResult = true
     func routeReadReceipt(_ receipt: ReadReceipt, to peerID: PeerID) -> Bool {
         routedReadReceipts.append((receipt.originalMessageID, peerID))

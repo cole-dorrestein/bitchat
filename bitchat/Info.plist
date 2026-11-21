@@ -4,6 +4,12 @@
 <dict>
 	<key>AppGroupID</key>
 	<string>$(APP_GROUP_ID)</string>
+	<!-- Offline hub peer (disaster mesh "Ask"): set to true on the hub Mac
+	     build so this BitChat peer answers private questions via the local
+	     hub responder (see bitchat/Services/HubBotService.swift). Stock
+	     builds leave this false; BITCHAT_HUB_PEER=1 also enables it. -->
+	<key>BitchatHubPeerEnabled</key>
+	<false/>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>

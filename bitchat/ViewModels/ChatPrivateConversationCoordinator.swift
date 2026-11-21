@@ -83,6 +83,10 @@ protocol ChatPrivateConversationContext: AnyObject {
 
     // MARK: Routing & acknowledgements
     func routePrivateMessage(_ content: String, to peerID: PeerID, recipientNickname: String, messageID: String)
+    /// Hub peer hook: offers a fresh, non-duplicate inbound private message
+    /// (addressed to us) to the offline hub bot. No-op unless this peer is
+    /// configured as the hub (see `HubBotService`).
+    func hubBotHandleIncomingPrivateMessage(from peerID: PeerID, content: String)
     @discardableResult
     func routeReadReceipt(_ receipt: ReadReceipt, to peerID: PeerID) -> Bool
     /// Confirms an authenticated delivery/read acknowledgement so the router
@@ -164,6 +168,12 @@ extension ChatViewModel: ChatPrivateConversationContext {
 
     func routePrivateMessage(_ content: String, to peerID: PeerID, recipientNickname: String, messageID: String) {
         messageRouter.sendPrivate(content, to: peerID, recipientNickname: recipientNickname, messageID: messageID)
+    }
+
+    func hubBotHandleIncomingPrivateMessage(from peerID: PeerID, content: String) {
+        hubBotService.handleIncomingPrivateMessage(from: peerID, content: content) { [weak self] text, target in
+            self?.sendPrivateMessage(text, to: target)
+        }
     }
 
     @discardableResult
@@ -682,6 +692,12 @@ final class ChatPrivateConversationCoordinator {
         if isDuplicateMessage(message.id, targetPeerID: peerID) {
             return
         }
+
+        // Hub peer: a fresh private message addressed to us is a question for
+        // the offline hub when this peer is configured as the hub. This is
+        // the single place a decrypted private message for us lands after
+        // dedup; HubBotService is inert otherwise.
+        context.hubBotHandleIncomingPrivateMessage(from: peerID, content: message.content)
 
         addMessageToPrivateChatsIfNeeded(message, targetPeerID: peerID)
         let noiseKey = peerID.noiseKey ?? context.noisePublicKey(for: peerID)
