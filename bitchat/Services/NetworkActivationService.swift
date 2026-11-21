@@ -262,6 +262,11 @@ final class NetworkActivationService: ObservableObject {
     /// Effective gate: base policy AND a usable network path. When there is
     /// provably no network, Tor bootstrap and relay reconnects are suppressed.
     private func effectiveAllowed() -> Bool {
+        // A peer configured as the offline hub (BitchatHubPeerEnabled /
+        // BITCHAT_HUB_PEER=1) never opens internet connections: no Tor
+        // bootstrap, no Nostr relays — only the local hub responder and
+        // callback (BLUEPRINT_1.md no-internet posture for the hub).
+        if HubBotService.isHubPeer() { return false }
         basePolicyAllowed() && reachabilityMonitor.isReachable
     }
 

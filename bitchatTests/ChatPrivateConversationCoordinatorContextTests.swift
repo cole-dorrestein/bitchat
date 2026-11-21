@@ -184,6 +184,11 @@ private final class MockChatPrivateConversationContext: ChatPrivateConversationC
         routedPrivateMessages.append((content, peerID, messageID))
     }
 
+    private(set) var hubBotMessages: [(peerID: PeerID, content: String)] = []
+    func hubBotHandleIncomingPrivateMessage(from peerID: PeerID, content: String) {
+        hubBotMessages.append((peerID, content))
+    }
+
     var routeReadReceiptResult = true
     func routeReadReceipt(_ receipt: ReadReceipt, to peerID: PeerID) -> Bool {
         routedReadReceipts.append((receipt.originalMessageID, peerID))
@@ -1232,5 +1237,45 @@ struct ChatPrivateConversationCoordinatorContextTests {
 
         #expect(context.routedPrivateMessages.map(\.content) == ["hello?"])
         #expect(context.privateChats[peerID]?.first?.deliveryStatus == .sending)
+    }
+
+    // MARK: Hub peer hook
+
+    /// A fresh, non-duplicate inbound private message is offered to the hub
+    /// hook exactly once; a redelivered copy of the same message must not
+    /// fire it again (the hook sits after the dedup check).
+    @Test @MainActor
+    func handlePrivateMessage_offersFreshDMToHubHookExactlyOnce() async {
+        let context = MockChatPrivateConversationContext()
+        let coordinator = ChatPrivateConversationCoordinator(context: context)
+        let peerID = PeerID(str: "0102030405060708")
+
+        coordinator.handlePrivateMessage(
+            makeIncomingMessage(id: "hub-1", content: "question for the hub?", senderPeerID: peerID)
+        )
+        #expect(context.hubBotMessages.count == 1)
+        #expect(context.hubBotMessages.first?.peerID == peerID)
+        #expect(context.hubBotMessages.first?.content == "question for the hub?")
+
+        // Duplicate delivery of the same message ID: dedup returns before the
+        // hook, so the hub never sees it twice.
+        coordinator.handlePrivateMessage(
+            makeIncomingMessage(id: "hub-1", content: "question for the hub?", senderPeerID: peerID)
+        )
+        #expect(context.hubBotMessages.count == 1)
+    }
+
+    /// [FAVORITED]/[UNFAVORITED] markers return before the hook and must never
+    /// be treated as questions.
+    @Test @MainActor
+    func handlePrivateMessage_doesNotOfferFavoritedMarkersToHubHook() async {
+        let context = MockChatPrivateConversationContext()
+        let coordinator = ChatPrivateConversationCoordinator(context: context)
+        let peerID = PeerID(str: "0102030405060708")
+
+        coordinator.handlePrivateMessage(
+            makeIncomingMessage(id: "hub-fav", content: "[FAVORITED]:npub1alice", senderPeerID: peerID)
+        )
+        #expect(context.hubBotMessages.isEmpty)
     }
 }
