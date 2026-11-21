@@ -7,8 +7,10 @@ enum HubProtocol {
     static let errorText = "The hub could not answer right now. Please try again."
     static let emptyText = "Send a question in plain words, for example: How do I make water safe to drink?"
     static let locationShareDefaultNote = "Shared location"
-    static let maxQuestionUnits = 500
-    static let maxAnswerBodyUnits = 900
+    static let maxMessageBytes = 255
+    static let maxQuestionBytes = 200
+    static let maxAnswerBodyBytes = 900
+    static let maxAnswerParts = 9
     static let ackTimeoutMS = 30_000
     static let answerTimeoutMS = 150_000
     static let modelTimeoutMS = 120_000
@@ -30,8 +32,29 @@ enum HubProtocol {
     private static func normalize(_ text: String) -> String {
         text.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
     }
-    private static func trim(_ text: String) -> String {
-        text.trimmingCharacters(in: .whitespacesAndNewlines)
+    // Python's str.strip/lstrip in the protocol reference use these Unicode whitespace scalars.
+    private static func isWhitespace(_ scalar: Unicode.Scalar) -> Bool {
+        switch scalar.value {
+        case 0x09...0x0D, 0x1C...0x20, 0x85, 0xA0, 0x1680, 0x2000...0x200A,
+             0x2028, 0x2029, 0x202F, 0x205F, 0x3000: return true
+        default: return false
+        }
+    }
+    private static func trim(_ text: String, leading: Bool = true, trailing: Bool = true) -> String {
+        let scalars = text.unicodeScalars
+        var start = scalars.startIndex
+        var end = scalars.endIndex
+        if leading {
+            while start < end && isWhitespace(scalars[start]) { scalars.formIndex(after: &start) }
+        }
+        if trailing {
+            while start < end {
+                let previous = scalars.index(before: end)
+                guard isWhitespace(scalars[previous]) else { break }
+                end = previous
+            }
+        }
+        return String(scalars[start..<end])
     }
     private static func decimal(_ value: Double) -> String {
         String(format: "%.5f", locale: Locale(identifier: "en_US_POSIX"), value)
@@ -51,13 +74,13 @@ enum HubProtocol {
               (-90...90).contains(lat), (-180...180).contains(lon) else { return nil }
         return Location(lat: lat, lon: lon)
     }
-    private static func prefix(_ text: String, units: Int) -> String {
+    private static func prefix(_ text: String, bytes: Int) -> String {
         var result = ""
         var used = 0
-        for character in text {
-            let size = String(character).utf16.count
-            if used + size > units { break }
-            result.append(character)
+        for scalar in text.unicodeScalars {
+            let size = scalar.utf8.count
+            if used + size > bytes { break }
+            result.unicodeScalars.append(scalar)
             used += size
         }
         return result
@@ -70,26 +93,62 @@ enum HubProtocol {
             location = decoded
             lines.removeLast()
         }
-        return Question(body: prefix(trim(lines.joined(separator: "\n")), units: maxQuestionUnits), location: location)
+        return Question(body: prefix(trim(lines.joined(separator: "\n")), bytes: maxQuestionBytes), location: location)
     }
     static func userContent(_ question: Question) -> String {
         guard let location = question.location else { return question.body }
         return "\(question.body)\n\nThe person's approximate location: \(decimal(location.lat)), \(decimal(location.lon)) (London, UK)."
     }
-    static func composeAnswer(_ output: String) -> String? {
-        let lines = normalize(output).components(separatedBy: "\n").filter { trim($0) != answerLabel }
-        var body = trim(lines.joined(separator: "\n"))
-        guard !body.isEmpty else { return nil }
-        if body.utf16.count > maxAnswerBodyUnits {
-            body = prefix(body, units: maxAnswerBodyUnits - 1)
-            let floor = maxAnswerBodyUnits / 2
-            if let newline = body.lastIndex(of: "\n"), body[..<newline].utf16.count >= floor {
-                body = String(body[..<newline])
-            } else if let space = body.lastIndex(of: " "), body[..<space].utf16.count >= floor {
-                body = String(body[..<space])
-            }
-            body = body.replacingOccurrences(of: #"\s+$"#, with: "", options: .regularExpression) + "…"
+    private static func truncateBody(_ body: String) -> String {
+        guard body.utf8.count > maxAnswerBodyBytes else { return body }
+        var cut = prefix(body, bytes: maxAnswerBodyBytes - "…".utf8.count)
+        let scalars = cut.unicodeScalars
+        let floor = maxAnswerBodyBytes / 2
+        if let newline = scalars.lastIndex(of: "\n"), scalars.distance(from: scalars.startIndex, to: newline) >= floor {
+            cut = String(scalars[..<newline])
+        } else if let space = scalars.lastIndex(of: " "), scalars.distance(from: scalars.startIndex, to: space) >= floor {
+            cut = String(scalars[..<space])
         }
-        return body + "\n" + answerLabel
+        return trim(cut, leading: false) + "…"
+    }
+    private static func splitAnswer(_ body: String) -> [String] {
+        let limit = maxMessageBytes - "(9/9) ".utf8.count
+        var chunks: [String] = []
+        var current = ""
+        for originalLine in body.components(separatedBy: "\n") {
+            var line = originalLine
+            while line.utf8.count > limit {
+                var head = prefix(line, bytes: limit)
+                let scalars = head.unicodeScalars
+                if let space = scalars.lastIndex(of: " "),
+                   scalars.distance(from: scalars.startIndex, to: space) >= scalars.count / 2 {
+                    head = String(scalars[..<space])
+                }
+                if !current.isEmpty { chunks.append(current); current = "" }
+                chunks.append(head)
+                line = trim(String(line.unicodeScalars.dropFirst(head.unicodeScalars.count)), trailing: false)
+            }
+            let candidate = current.isEmpty ? line : current + "\n" + line
+            if candidate.utf8.count <= limit {
+                current = candidate
+            } else {
+                chunks.append(current)
+                current = line
+            }
+        }
+        chunks.append(current)
+        chunks = chunks.map { trim($0) }.filter { !$0.isEmpty }
+        if chunks.count > maxAnswerParts - 1 {
+            chunks = Array(chunks.prefix(maxAnswerParts - 1))
+            chunks[chunks.count - 1] = trim(prefix(chunks.last!, bytes: limit - "…".utf8.count), leading: false) + "…"
+        }
+        return chunks
+    }
+    static func composeAnswer(_ output: String) -> [String]? {
+        let lines = normalize(output).components(separatedBy: "\n").filter { trim($0) != answerLabel }
+        let body = trim(lines.joined(separator: "\n"))
+        guard !body.isEmpty else { return nil }
+        let parts = splitAnswer(truncateBody(body)) + [answerLabel]
+        return parts.enumerated().map { "(\($0.offset + 1)/\(parts.count)) \($0.element)" }
     }
 }

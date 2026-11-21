@@ -42,8 +42,8 @@ actor HubResponder {
                 let output = try await withHubTimeout(milliseconds: timeoutMS) {
                     try await model.answer(system: HubProtocol.systemPrompt, user: HubProtocol.userContent(question))
                 }
-                if let answer = HubProtocol.composeAnswer(output) {
-                    await send(peerID, answer)
+                if let messages = HubProtocol.composeAnswer(output) {
+                    for message in messages { await send(peerID, message) }
                     outcome = "answered"
                 } else {
                     await send(peerID, HubProtocol.errorText)
@@ -56,6 +56,6 @@ actor HubResponder {
         }
         let latency = max(0, Int(Date().timeIntervalSince(received) * 1000))
         let time = ISO8601DateFormatter().string(from: Date())
-        log("\(time) sender=\(peerID.prefix(8)) question_units=\(question.body.utf16.count) location=\(question.location != nil) outcome=\(outcome) latency_ms=\(latency)")
+        log("\(time) sender=\(peerID.prefix(8)) question_bytes=\(question.body.utf8.count) location=\(question.location != nil) outcome=\(outcome) latency_ms=\(latency)")
     }
 }
