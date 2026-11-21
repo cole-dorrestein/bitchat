@@ -11,27 +11,38 @@
 //   2. It forwards the question text (plus the optional `loc: lat,lon`
 //      line) to the hub responder on the local hub machine over HTTP —
 //      POST to HUB_RESPONDER_URL (default http://127.0.0.1:8090/ask) with
-//      JSON {sender, question, loc?, callback_url?}. The responder acks
-//      immediately and later POSTs the final answer back to our local
-//      callback endpoint. No question ever goes to a cloud model API; the
-//      only network calls in this file are the responder POST and the
-//      local callback listener.
+//      JSON {request_id, sender, question, loc?, callback_url?}. Each
+//      question gets its own request_id; the responder echoes it in the
+//      callback payload so answers correlate to the right question even
+//      when several are in flight for one sender (OLLAMA_NUM_PARALLEL=4).
+//      The responder acks immediately and later POSTs the final answer back
+//      to our local callback endpoint. No question ever goes to a cloud
+//      model API; the only network calls in this file are the responder POST
+//      and the local callback listener.
 //   3. On callback it sends the answer as a second private message to the
-//      original sender, appending the AI disclaimer if it is missing.
-//   4. If the responder is unreachable or no callback arrives within the
-//      configured timeout, it replies "Hub not reachable. Please retry.".
+//      original sender, appending the AI disclaimer if it is missing and
+//      always keeping the message within the mesh short-text cap.
+//   4. If the responder is unreachable, the question is empty, or no
+//      callback arrives within the configured timeout, it replies with a
+//      short second message ("No question received…" / "Hub not reachable.
+//      Please retry.") so the asker never hangs after the ack.
 //
 // How a peer becomes the hub (picked mechanism, documented): the Info.plist
 // flag `BitchatHubPeerEnabled` (shipped as `false`; the demo Mac hub build
 // sets it to `true`) or, without rebuilding, the environment variable
 // `BITCHAT_HUB_PEER=1`. Everything else is env-configurable:
 //
-//   HUB_RESPONDER_URL    responder endpoint   (default http://127.0.0.1:8090/ask)
-//   HUB_CALLBACK_PORT    local callback port  (default 8091)
-//   HUB_CALLBACK_URL     full callback URL override, e.g. when the responder
-//                        reaches this Mac on another interface
-//   HUB_TIMEOUT_SECONDS  answer timeout before "Hub not reachable" (default 120)
-//   HUB_MAX_ANSWER_CHARS max answer length sent over the mesh (default 1000)
+//   HUB_RESPONDER_URL     responder endpoint   (default http://127.0.0.1:8090/ask)
+//   HUB_CALLBACK_PORT     local callback port  (default 8091)
+//   HUB_CALLBACK_URL      full callback URL override, e.g. when the responder
+//                         reaches this Mac on another interface
+//   HUB_TIMEOUT_SECONDS   answer timeout before "Hub not reachable" (default 120, clamped 1...3600)
+//   HUB_MAX_ANSWER_CHARS  max answer length sent over the mesh (default 1000)
+//   HUB_MAX_QUESTION_CHARS max question length forwarded to the responder (default 4096)
+//
+// In hub mode the peer also stays fully offline on the internet side:
+// `NetworkActivationService` refuses to start Tor or connect Nostr relays
+// while `isHubPeer()` is true.
 //
 
 import BitFoundation
@@ -49,26 +60,40 @@ final class HubBotService {
         let callbackURLOverride: String?
         let timeout: TimeInterval
         let maxAnswerChars: Int
+        let maxQuestionChars: Int
 
         static let defaultResponderURL = URL(string: "http://127.0.0.1:8090/ask")!
+        /// Bounds for HUB_TIMEOUT_SECONDS: a negative, NaN or infinite env
+        /// value must never reach `UInt64(timeout * 1e9)` (that conversion
+        /// traps), so the raw value is clamped here.
+        static let minTimeout: TimeInterval = 1
+        static let maxTimeout: TimeInterval = 3600
+        static let defaultTimeout: TimeInterval = 120
 
         init(environment: [String: String] = ProcessInfo.processInfo.environment,
              infoPlist: [String: Any] = Bundle.main.infoDictionary ?? [:]) {
             // Hub mode is opt-in: Info.plist flag (set on the hub Mac build)
             // or the BITCHAT_HUB_PEER=1 environment override.
-            let plistEnabled = infoPlist["BitchatHubPeerEnabled"] as? Bool ?? false
-            self.enabled = plistEnabled || environment["BITCHAT_HUB_PEER"] == "1"
+            self.enabled = HubBotService.isHubPeer(environment: environment, infoPlist: infoPlist)
             self.responderURL = environment["HUB_RESPONDER_URL"].flatMap { URL(string: $0) }
                 ?? Self.defaultResponderURL
             self.callbackPort = environment["HUB_CALLBACK_PORT"].flatMap { Int($0) }.flatMap { UInt16(exactly: $0) }
                 ?? 8091
             self.callbackURLOverride = environment["HUB_CALLBACK_URL"]
-            self.timeout = environment["HUB_TIMEOUT_SECONDS"].flatMap { Double($0) } ?? 120
-            self.maxAnswerChars = environment["HUB_MAX_ANSWER_CHARS"].flatMap { Int($0) } ?? 1000
+            if let raw = environment["HUB_TIMEOUT_SECONDS"].flatMap({ Double($0) }), raw.isFinite {
+                self.timeout = min(max(raw, Self.minTimeout), Self.maxTimeout)
+            } else {
+                self.timeout = Self.defaultTimeout
+            }
+            self.maxAnswerChars = environment["HUB_MAX_ANSWER_CHARS"].flatMap { Int($0) }.map { max($0, 1) } ?? 1000
+            self.maxQuestionChars = environment["HUB_MAX_QUESTION_CHARS"].flatMap { Int($0) }.map { max($0, 1) } ?? 4096
         }
     }
 
     let config: Config
+    /// Responder HTTP session. Injectable so tests can record the POSTs
+    /// instead of hitting the network.
+    let session: URLSession
 
     private struct PendingQuestion {
         let requestID: String
@@ -84,8 +109,20 @@ final class HubBotService {
     private var listener: NWListener?
     private let serverQueue = DispatchQueue(label: "bitchat.hubbot.callback")
 
-    init(config: Config = Config()) {
+    init(config: Config = Config(), session: URLSession = .shared) {
         self.config = config
+        self.session = session
+    }
+
+    /// True when this peer is configured as the offline hub: the Info.plist
+    /// flag `BitchatHubPeerEnabled` (hub build) or `BITCHAT_HUB_PEER=1`.
+    /// Also read by `NetworkActivationService` to keep Tor/Nostr off while
+    /// the peer is the hub (the hub's no-internet posture).
+    nonisolated static func isHubPeer(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        infoPlist: [String: Any] = Bundle.main.infoDictionary ?? [:]
+    ) -> Bool {
+        (infoPlist["BitchatHubPeerEnabled"] as? Bool ?? false) || environment["BITCHAT_HUB_PEER"] == "1"
     }
 
     // MARK: - Lifecycle
@@ -94,8 +131,18 @@ final class HubBotService {
     /// configured as the hub.
     func start() {
         guard config.enabled, listener == nil else { return }
+        // Bind the listener to the exact host the callback URL advertises —
+        // loopback or the local-link address, never all interfaces — so the
+        // callback endpoint is not reachable from other networks.
+        let host = callbackHost()
+        let port = NWEndpoint.Port(integerLiteral: config.callbackPort)
         do {
-            let listener = try NWListener(using: .tcp, on: NWEndpoint.Port(rawValue: config.callbackPort))
+            let parameters = NWParameters.tcp
+            parameters.requiredLocalEndpoint = NWEndpoint.hostPort(
+                host: NWEndpoint.Host(host),
+                port: port
+            )
+            let listener = try NWListener(using: parameters, on: port)
             listener.newConnectionHandler = { [weak self] connection in
                 connection.start(queue: self?.serverQueue ?? .global())
                 self?.handleCallbackConnection(connection)
@@ -109,7 +156,7 @@ final class HubBotService {
             self.listener = listener
             SecureLogger.info("HubBot: hub peer active, answering DMs, callback at \(callbackURLString())", category: .session)
         } catch {
-            SecureLogger.error("HubBot: could not start callback listener on port \(config.callbackPort): \(error.localizedDescription)", category: .session)
+            SecureLogger.error("HubBot: could not start callback listener on \(host):\(config.callbackPort): \(error.localizedDescription)", category: .session)
         }
     }
 
@@ -130,7 +177,12 @@ final class HubBotService {
         sendPrivate(HubBotMessageFormat.ackText, peerID)
 
         let (question, loc) = HubBotMessageFormat.splitQuestionAndLoc(content)
-        guard !question.isEmpty else { return }
+        guard !question.isEmpty else {
+            // Empty or loc-only DM: still send the second message of the
+            // two-message protocol instead of leaving the asker hanging.
+            sendPrivate(HubBotMessageFormat.emptyQuestionText, peerID)
+            return
+        }
 
         let requestID = UUID().uuidString
         let deliver: @MainActor (String) -> Void = { text in sendPrivate(text, peerID) }
@@ -144,7 +196,10 @@ final class HubBotService {
         // (d) One deadline per question: responder unreachable or no callback
         // within the configured timeout both end in the not-reachable reply.
         let timeoutTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64((self?.config.timeout ?? 120) * 1_000_000_000))
+            // config.timeout is clamped to 1...3600; max(0, …) keeps the
+            // UInt64 conversion trap-free even for a NaN/negative value.
+            let seconds = max(0, self?.config.timeout ?? Config.defaultTimeout)
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
             guard let self else { return }
             if let question = pending.removeValue(forKey: requestID) {
                 SecureLogger.warning("HubBot: no answer for \(requestID.prefix(8))… within \(config.timeout)s, telling sender the hub is not reachable", category: .session)
@@ -153,21 +208,45 @@ final class HubBotService {
         }
         pending[requestID]?.timeoutTask = timeoutTask
 
-        // (b) Forward the question to the hub responder over the local link.
+        // (b) Forward the question to the hub responder over the local link,
+        // capped so an oversized DM cannot push an oversized body at it.
+        let cappedQuestion = String(question.prefix(config.maxQuestionChars))
         Task { [weak self] in
-            await self?.postToResponder(requestID: requestID, sender: peerID, question: question, loc: loc)
+            await self?.postToResponder(requestID: requestID, sender: peerID, question: cappedQuestion, loc: loc)
         }
     }
 
-    private func postToResponder(requestID: String, sender: PeerID, question: String, loc: String?) async {
+    /// The JSON body POSTed to the responder. `request_id` is unique per
+    /// question; the responder echoes it in the callback payload so the
+    /// answer correlates to the right question (with OLLAMA_NUM_PARALLEL=4,
+    /// two questions from one phone can otherwise complete out of order).
+    static func responderPayload(
+        requestID: String,
+        sender: PeerID,
+        question: String,
+        loc: String?,
+        callbackURL: String
+    ) -> [String: Any] {
         var payload: [String: Any] = [
+            "request_id": requestID,
             "sender": sender.id,
             "question": question,
-            "callback_url": callbackURLString()
+            "callback_url": callbackURL
         ]
         if let loc {
             payload["loc"] = loc
         }
+        return payload
+    }
+
+    private func postToResponder(requestID: String, sender: PeerID, question: String, loc: String?) async {
+        let payload = Self.responderPayload(
+            requestID: requestID,
+            sender: sender,
+            question: question,
+            loc: loc,
+            callbackURL: callbackURLString()
+        )
         guard let body = try? JSONSerialization.data(withJSONObject: payload) else { return }
 
         var request = URLRequest(url: config.responderURL)
@@ -177,7 +256,7 @@ final class HubBotService {
         request.timeoutInterval = max(config.timeout, 10)
 
         do {
-            let (_, response) = try await URLSession.shared.data(for: request)
+            let (_, response) = try await session.data(for: request)
             guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
                 SecureLogger.warning("HubBot: responder at \(config.responderURL) did not ack (request \(requestID.prefix(8))…)", category: .session)
                 return // the deadline task sends the not-reachable reply
@@ -191,14 +270,25 @@ final class HubBotService {
 
     // MARK: - Callback endpoint
 
+    /// The host the callback listener binds to and the advertised URL uses:
+    /// the override's host when `HUB_CALLBACK_URL` is set, else this
+    /// machine's local-link IPv4, else loopback.
+    private func callbackHost() -> String {
+        if let override = config.callbackURLOverride,
+           let url = URL(string: override),
+           let host = url.host {
+            return host
+        }
+        return Self.localIPv4Address() ?? "127.0.0.1"
+    }
+
     /// The URL advertised to the responder. Overridable for setups where the
     /// responder reaches this Mac on a different interface.
     func callbackURLString() -> String {
         if let override = config.callbackURLOverride {
             return override
         }
-        let host = Self.localIPv4Address() ?? "127.0.0.1"
-        return "http://\(host):\(config.callbackPort)/hub-callback"
+        return "http://\(callbackHost()):\(config.callbackPort)/hub-callback"
     }
 
     /// First non-loopback IPv4 address (prefers en0) so the responder on the
@@ -235,29 +325,47 @@ final class HubBotService {
         state.start()
     }
 
+    /// Handles one callback POST body. Internal (not private) so tests can
+    /// drive the correlation directly.
     @MainActor
-    private func handleCallback(body: Data) {
+    func handleCallback(body: Data) {
         struct CallbackPayload: Decodable {
+            let request_id: String?
             let sender: String?
             let answer: String?
             let result: String?
         }
         guard let payload = try? JSONDecoder().decode(CallbackPayload.self, from: body),
-              let sender = payload.sender?.lowercased(),
               let answer = payload.answer ?? payload.result
         else {
             SecureLogger.warning("HubBot: ignoring undecodable callback payload", category: .session)
             return
         }
 
-        // The responder echoes `sender` (the asker's peer ID hex). Match the
-        // oldest in-flight question from that sender.
-        guard let match = pending.values
-            .filter({ $0.senderPeerID.id.lowercased() == sender })
-            .sorted(by: { $0.createdAt < $1.createdAt })
-            .first
-        else {
-            SecureLogger.warning("HubBot: callback for unknown sender \(sender.prefix(8))…", category: .session)
+        // Correlate on request_id when the responder echoes it (preferred; the
+        // responder contract in hub/responder.py echoes it). A legacy
+        // responder that omits it falls back to the oldest in-flight question
+        // from the echoed sender.
+        var match: PendingQuestion?
+        if let requestID = payload.request_id, !requestID.isEmpty {
+            guard let found = pending[requestID] else {
+                SecureLogger.warning("HubBot: callback for unknown request_id \(requestID.prefix(8))…", category: .session)
+                return
+            }
+            if let sender = payload.sender, !sender.isEmpty,
+               found.senderPeerID.id.lowercased() != sender.lowercased() {
+                // request_id is authoritative; sender is a consistency check only.
+                SecureLogger.warning("HubBot: request \(requestID.prefix(8))… sender mismatch (\(sender.prefix(8))… vs \(found.senderPeerID.id.prefix(8))…)", category: .session)
+            }
+            match = found
+        } else if let sender = payload.sender?.lowercased(), !sender.isEmpty {
+            match = pending.values
+                .filter({ $0.senderPeerID.id.lowercased() == sender })
+                .sorted(by: { $0.createdAt < $1.createdAt })
+                .first
+        }
+        guard let match else {
+            SecureLogger.warning("HubBot: callback with no matching in-flight question", category: .session)
             return
         }
 
@@ -265,9 +373,9 @@ final class HubBotService {
         match.timeoutTask?.cancel()
 
         // (c) Second private message with the answer, disclaimer appended if
-        // missing, kept short for the mesh.
+        // missing, always kept within the mesh short-text cap.
         let text = HubBotMessageFormat.appendDisclaimerIfMissing(answer, maxLength: config.maxAnswerChars)
-        SecureLogger.info("HubBot: answer for \(match.requestID.prefix(8))… from \(sender.prefix(8))… (\(text.count) chars)", category: .session)
+        SecureLogger.info("HubBot: answer for \(match.requestID.prefix(8))… (\(text.count) chars)", category: .session)
         match.deliver(text)
     }
 }
@@ -277,6 +385,10 @@ final class HubBotService {
 /// One accepted callback connection. All access is serialized on the
 /// listener's queue; the parsed body is handed to the main actor.
 private final class CallbackConnectionState: @unchecked Sendable {
+    /// Largest accepted request head (headers) and body, in bytes.
+    private static let maxHeaderBytes = 16 * 1024
+    private static let maxBodyBytes = 64 * 1024
+
     private let connection: NWConnection
     private let onBody: @Sendable (Data) -> Void
     private var buffer = Data()
@@ -291,38 +403,59 @@ private final class CallbackConnectionState: @unchecked Sendable {
     }
 
     private func receive() {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, isComplete, error in
+        connection.receive(minimumIncompleteLength: 1, maximumLength: Self.maxBodyBytes) { [weak self] data, _, isComplete, error in
             guard let self else { return }
             if let data {
                 buffer.append(data)
             }
-            if let body = Self.extractBody(from: buffer) {
+            switch Self.parseRequest(from: buffer) {
+            case .body(let body):
                 onBody(body)
                 respond(status: "200 OK", body: Data("{\"ok\":true}".utf8))
-            } else if isComplete || error != nil {
-                connection.cancel()
-            } else {
-                receive()
+            case .invalid:
+                // Rejected before any body is read (bad Content-Length or an
+                // oversized head); answer 400 and close.
+                respond(status: "400 Bad Request", body: Data("{\"ok\":false}".utf8))
+            case .incomplete:
+                if isComplete || error != nil {
+                    connection.cancel()
+                } else {
+                    receive()
+                }
             }
         }
     }
 
-    /// Returns the request body once the full HTTP request (headers +
-    /// Content-Length bytes of body) has arrived, else nil.
-    private static func extractBody(from data: Data) -> Data? {
-        guard let headerEnd = data.range(of: Data("\r\n\r\n".utf8)) else { return nil }
+    private enum ParseResult {
+        case incomplete
+        case invalid
+        case body(Data)
+    }
+
+    /// Parses the request head and returns the body once the full HTTP
+    /// request (headers + Content-Length bytes of body) has arrived.
+    /// `Content-Length` is validated before any body bytes are read: a
+    /// missing, negative, non-numeric or oversized value is rejected instead
+    /// of underflowing the index math or buffering without bound.
+    private static func parseRequest(from data: Data) -> ParseResult {
+        guard let headerEnd = data.range(of: Data("\r\n\r\n".utf8)) else {
+            return data.count > maxHeaderBytes ? .invalid : .incomplete
+        }
         let header = String(decoding: data[data.startIndex..<headerEnd.lowerBound], as: UTF8.self)
-        var contentLength = 0
+        var contentLength: Int?
         for line in header.split(separator: "\r\n").dropFirst() {
             let parts = line.split(separator: ":", maxSplits: 1)
             if parts.count == 2, parts[0].trimmingCharacters(in: .whitespaces).lowercased() == "content-length" {
-                contentLength = Int(parts[1].trimmingCharacters(in: .whitespaces)) ?? 0
+                contentLength = Int(parts[1].trimmingCharacters(in: .whitespacesAndNewlines))
             }
+        }
+        guard let contentLength, contentLength > 0, contentLength <= maxBodyBytes else {
+            return .invalid
         }
         let bodyStart = headerEnd.upperBound
         let available = data.distance(from: bodyStart, to: data.endIndex)
-        guard available >= contentLength else { return nil }
-        return data[bodyStart..<(data.index(bodyStart, offsetBy: contentLength))]
+        guard available >= contentLength else { return .incomplete }
+        return .body(data[bodyStart..<(data.index(bodyStart, offsetBy: contentLength))])
     }
 
     private func respond(status: String, body: Data) {

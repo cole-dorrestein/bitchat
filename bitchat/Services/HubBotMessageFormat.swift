@@ -19,6 +19,10 @@ enum HubBotMessageFormat {
     /// the configured timeout.
     static let unreachableText = "Hub not reachable. Please retry."
 
+    /// Second private reply when the incoming DM carries no question text
+    /// (empty, or only a `loc:` line), so the asker never hangs after the ack.
+    static let emptyQuestionText = "No question received. Send your question as plain text, with an optional loc: lat,lon line."
+
     /// Appended to every hub answer (BLUEPRINT_1.md: the label must reach
     /// people who use stock BitChat too).
     static let disclaimer = "AI answer from an open-weight model on the hub. Not verified emergency advice."
@@ -52,17 +56,43 @@ enum HubBotMessageFormat {
         return (content.trimmingCharacters(in: .whitespacesAndNewlines), nil)
     }
 
-    /// Returns the answer with the disclaimer appended if it is missing,
-    /// truncated so the whole message stays within `maxLength` characters
-    /// (mesh traffic stays short text only; the disclaimer always survives
-    /// the truncation).
+    /// True when `text` ends with the disclaimer (case-insensitive). The hub
+    /// *ends* every answer with it (BLUEPRINT_1.md), so it is matched as a
+    /// suffix, not as a substring anywhere in the answer.
+    static func hasDisclaimerSuffix(_ text: String) -> Bool {
+        guard text.count >= disclaimer.count else { return false }
+        return text.suffix(disclaimer.count).compare(disclaimer, options: .caseInsensitive) == .orderedSame
+    }
+
+    /// Returns the answer with the disclaimer appended if it is missing.
+    /// `maxLength` is always enforced — including when the answer already
+    /// carries the disclaimer — by truncating the answer body and keeping the
+    /// disclaimer tail, so mesh traffic stays short text only and the label
+    /// always survives truncation.
     static func appendDisclaimerIfMissing(_ answer: String, maxLength: Int) -> String {
+        guard maxLength > 0 else { return "" }
         let trimmed = answer.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.range(of: disclaimer, options: .caseInsensitive) != nil {
-            return trimmed
-        }
         let separator = "\n"
+
+        let body: String
+        if hasDisclaimerSuffix(trimmed) {
+            // Already labeled: strip the label and re-append it below so the
+            // cap is enforced uniformly and the tail always survives.
+            body = String(trimmed.dropLast(disclaimer.count))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        } else {
+            body = trimmed
+        }
+
+        guard maxLength > disclaimer.count else {
+            // Degenerate cap: keep as much of the label as fits.
+            return String(disclaimer.prefix(maxLength))
+        }
         let budget = max(0, maxLength - separator.count - disclaimer.count)
-        return String(trimmed.prefix(budget)) + separator + disclaimer
+        let cappedBody = String(body.prefix(budget))
+        if cappedBody.isEmpty {
+            return disclaimer
+        }
+        return cappedBody + separator + disclaimer
     }
 }
